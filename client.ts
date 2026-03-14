@@ -53,6 +53,18 @@ export interface WssClient {
   reconnect(): void;
 }
 
+// 辅助函数：将 Promise 转换为 [err, data] 元组以消除 try-catch
+async function to<T>(
+  promise: Promise<T>,
+): Promise<[Error | null, T | undefined]> {
+  try {
+    const data = await promise;
+    return [null, data];
+  } catch (e) {
+    return [e instanceof Error ? e : new Error(String(e)), undefined];
+  }
+}
+
 // 创建一个新的 WebSocket 客户端实例。
 // @param url WebSocket 服务器 URL
 // @param options 客户端选项
@@ -66,14 +78,14 @@ export const newWssClient = (
   const finalOptions = {
     maxReconnectDelay: 0,
     ...options,
-  }; // 合并默认选项
+  };
 
   const nativeWSSFactory = (
     globalThis as typeof globalThis & {
       WebSocketStream?: WSSFactory;
     }
   ).WebSocketStream;
-  const RECONNECT_BASE_DELAY = 1000; // ms
+  const RECONNECT_BASE_DELAY = 1000;
 
   let activeWSS: WSS | undefined;
   let reader: ReadableStreamDefaultReader<MessageData> | undefined;
@@ -89,10 +101,6 @@ export const newWssClient = (
 
   // --- Internal Helper Functions ---
 
-  function toError(e: unknown): Error {
-    return e instanceof Error ? e : new Error(String(e));
-  }
-
   function clearReconnectTimers(): void {
     clearTimeout(reconnectTimer);
     reconnectTimer = undefined;
@@ -102,43 +110,52 @@ export const newWssClient = (
   }
 
   function resetConnectionResources(): void {
-    try {
-      reader?.releaseLock();
-    } catch {
-      /* ignore released readers */
+    // 资源清理应是原子的，不应受个别错误影响
+    if (reader) {
+      to(Promise.resolve(reader.releaseLock()));
     }
-    try {
-      writer?.releaseLock();
-    } catch {
-      /* ignore released writers */
+    if (writer) {
+      to(Promise.resolve(writer.releaseLock()));
     }
     reader = undefined;
     writer = undefined;
     activeWSS = undefined;
   }
 
-  function attachWSS(stream: WSS): void {
+  async function attachWSS(stream: WSS): Promise<void> {
     activeWSS = stream;
     reader = stream.readable.getReader();
     writer = stream.writable.getWriter();
 
-    if (stream.opened) {
-      stream.opened
-        .then(() => handleConnectionOpen())
-        .catch((e) => {
-          finalOptions.erred?.(toError(e));
-          handleConnectionClose();
-        });
-    } else {
+    // 处理连接建立
+    handleOpened(stream);
+    // 处理连接关闭
+    handleClosed(stream);
+  }
+
+  async function handleOpened(stream: WSS): Promise<void> {
+    if (!stream.opened) {
       handleConnectionOpen();
+      return;
     }
 
-    stream.closed
-      .then((event: CloseEvent) => handleConnectionClose(event))
-      .catch((e) => {
-        finalOptions.erred?.(toError(e));
-        handleConnectionClose();
-      });
+    const [err] = await to(stream.opened);
+    if (err) {
+      finalOptions.erred?.(err);
+      handleConnectionClose();
+      return;
+    }
+    handleConnectionOpen();
+  }
+
+  async function handleClosed(stream: WSS): Promise<void> {
+    const [err, event] = await to(stream.closed);
+    if (err) {
+      finalOptions.erred?.(err);
+      handleConnectionClose();
+      return;
+    }
+    handleConnectionClose(event);
   }
 
   function createFallbackWSS(): WSS {
@@ -183,34 +200,18 @@ export const newWssClient = (
 
     const readable = new ReadableStream<MessageData>({
       start(controller) {
-        webSocket.onopen = () => {
-          resolveOpened();
-        };
-        webSocket.onmessage = (event: MessageEvent<MessageData>) => {
-          controller.enqueue(event.data);
-        };
-        webSocket.onclose = (event: CloseEvent) => {
-          if (!opened) {
-            rejectOpened(event);
-          }
+        webSocket.onopen = () => resolveOpened();
+        webSocket.onmessage = (event) => controller.enqueue(event.data);
+        webSocket.onclose = (event) => {
+          if (!opened) rejectOpened(event);
           resolveClosed(event);
-          try {
-            controller.close();
-          } catch {
-            /* ignore duplicate close */
-          }
+          to(Promise.resolve(controller.close()));
         };
         webSocket.onerror = () => {
           const error = new Error("WebSocket fallback error");
-          if (!opened) {
-            rejectOpened(error);
-          }
+          if (!opened) rejectOpened(error);
           rejectClosed(error);
-          try {
-            controller.error(error);
-          } catch {
-            /* ignore duplicate error */
-          }
+          to(Promise.resolve(controller.error(error)));
         };
       },
       cancel() {
@@ -236,11 +237,11 @@ export const newWssClient = (
           webSocket.readyState === WebSocket.CLOSING ||
           webSocket.readyState === WebSocket.CLOSED
         ) {
-          await closed.catch(() => undefined);
+          await to(closed);
           return;
         }
         webSocket.close(1000, "Writable stream closed");
-        await closed.catch(() => undefined);
+        await to(closed);
       },
       async abort(reason) {
         if (
@@ -253,7 +254,7 @@ export const newWssClient = (
               : "Writable stream aborted";
           webSocket.close(1000, message);
         }
-        await closed.catch(() => undefined);
+        await to(closed);
       },
     });
 
@@ -288,63 +289,83 @@ export const newWssClient = (
     resetConnectionResources();
     clearReconnectTimers();
 
-    if (forceReconnect && !isManualClose) {
-      forceReconnect = false;
-      reconnectAttempts = 0;
-      openConnection();
-      return;
-    }
-    forceReconnect = false;
+    if (shouldForceReconnect()) return;
 
+    processReconnect(event, previousState);
+  }
+
+  function shouldForceReconnect(): boolean {
+    if (!forceReconnect || isManualClose) return false;
+    forceReconnect = false;
+    reconnectAttempts = 0;
+    openConnection();
+    return true;
+  }
+
+  function processReconnect(
+    event: CloseEvent | undefined,
+    previousState: ConnectionState,
+  ): void {
+    forceReconnect = false;
     const isNormalClose = event?.code === 1000;
     const shouldReconnect =
       finalOptions.maxReconnectDelay > 0 && !isManualClose && !isNormalClose;
 
-    if (shouldReconnect) {
-      const delay = Math.min(
-        finalOptions.maxReconnectDelay!,
-        RECONNECT_BASE_DELAY * 2 ** reconnectAttempts,
-      );
-      reconnectAttempts++;
-      console.log(
-        `Connection lost, attempting to reconnect in ${delay / 1000}s...`,
-      );
-      nextReconnectTime = Date.now() + delay;
+    if (!shouldReconnect) {
+      finalizeClosure(previousState);
+      return;
+    }
+    setupReconnect();
+  }
 
-      finalOptions.reConnecting?.(delay, reconnectAttempts);
-
-      reconnectingInterval = setInterval(() => {
-        const remaining = nextReconnectTime
-          ? nextReconnectTime - Date.now()
-          : 0;
-        if (remaining > 0) {
-          finalOptions.reConnecting?.(Math.round(remaining), reconnectAttempts);
-        } else {
-          clearInterval(reconnectingInterval);
-          reconnectingInterval = undefined;
-        }
-      }, 1000);
-
-      reconnectTimer = setTimeout(() => {
-        clearReconnectTimers();
-        openConnection();
-      }, delay);
-    } else {
-      putQueue = []; // 永久关闭，清空队列
-      reconnectAttempts = 0; // 重置计数
-      if (previousState === ConnectionState.Opened || isManualClose)
-        finalOptions.closed?.();
+  function finalizeClosure(previousState: ConnectionState): void {
+    putQueue = [];
+    reconnectAttempts = 0;
+    if (previousState === ConnectionState.Opened || isManualClose) {
+      finalOptions.closed?.();
     }
   }
 
+  function setupReconnect(): void {
+    const delay = Math.min(
+      finalOptions.maxReconnectDelay!,
+      RECONNECT_BASE_DELAY * 2 ** reconnectAttempts,
+    );
+    reconnectAttempts++;
+    nextReconnectTime = Date.now() + delay;
+
+    finalOptions.reConnecting?.(delay, reconnectAttempts);
+    startReconnectTimer(delay);
+  }
+
+  function startReconnectTimer(delay: number): void {
+    reconnectingInterval = setInterval(() => {
+      const remaining = nextReconnectTime ? nextReconnectTime - Date.now() : 0;
+      if (remaining <= 0) {
+        clearInterval(reconnectingInterval);
+        reconnectingInterval = undefined;
+        return;
+      }
+      finalOptions.reConnecting?.(Math.round(remaining), reconnectAttempts);
+    }, 1000);
+
+    reconnectTimer = setTimeout(() => {
+      clearReconnectTimers();
+      openConnection();
+    }, delay);
+  }
+
   async function writeMessage(data: MessageData): Promise<void> {
-    try {
-      if (!writer) throw new Error("Writable stream is not available.");
-      await writer.write(data);
-    } catch (e) {
-      const error = toError(e);
-      finalOptions.erred?.(error);
-      throw error;
+    if (!writer) {
+      const err = new Error("Writable stream is not available.");
+      finalOptions.erred?.(err);
+      throw err;
+    }
+
+    const [err] = await to(writer.write(data));
+    if (err) {
+      finalOptions.erred?.(err);
+      throw err;
     }
   }
 
@@ -354,9 +375,13 @@ export const newWssClient = (
     connectionState = ConnectionState.Opened;
     finalOptions.stateChanged?.(connectionState);
     clearReconnectTimers();
-    reconnectAttempts = 0; // 连接成功，重置重连尝试次数
+    reconnectAttempts = 0;
     finalOptions.opened?.();
 
+    flushPutQueue();
+  }
+
+  function flushPutQueue(): void {
     const queue = putQueue;
     putQueue = [];
     queue.forEach((data) => {
@@ -364,53 +389,54 @@ export const newWssClient = (
     });
   }
 
-  function initNativeWSS(): void {
-    try {
-      attachWSS(new nativeWSSFactory!(url));
-    } catch (e) {
-      console.error(
-        "WebSocketStream initialization failed, falling back...",
-        e,
-      );
-      finalOptions.erred?.(toError(e));
-      initFallbackWSS();
-    }
-  }
-
-  function initFallbackWSS(): void {
-    attachWSS(createFallbackWSS());
-  }
-
   function openConnection(): void {
     if (
       connectionState === ConnectionState.Connecting ||
       connectionState === ConnectionState.Opened
-    )
+    ) {
       return;
+    }
 
     isManualClose = false;
     connectionState = ConnectionState.Connecting;
     finalOptions.stateChanged?.(connectionState);
 
-    if (nativeWSSFactory) initNativeWSS();
-    else initFallbackWSS();
+    initWSS();
+  }
+
+  async function initWSS(): Promise<void> {
+    if (!nativeWSSFactory) {
+      attachWSS(createFallbackWSS());
+      return;
+    }
+
+    const [err, stream] = await to(
+      Promise.resolve(new nativeWSSFactory!(url)),
+    );
+    if (err) {
+      finalOptions.erred?.(err);
+      attachWSS(createFallbackWSS());
+      return;
+    }
+    attachWSS(stream!);
   }
 
   // --- Public API ---
 
   async function get(): Promise<MessageData> {
-    if (connectionState === ConnectionState.Closed || !reader)
+    if (connectionState === ConnectionState.Closed || !reader) {
       throw new Error("Stream is closed.");
-
-    try {
-      const { value, done } = await reader.read();
-      if (done) throw new Error("Stream has been closed.");
-      return value;
-    } catch (e) {
-      const error = toError(e);
-      finalOptions.erred?.(error);
-      throw error;
     }
+
+    const [err, result] = await to(reader.read());
+    if (err) {
+      finalOptions.erred?.(err);
+      throw err;
+    }
+    if (result?.done) {
+      throw new Error("Stream has been closed.");
+    }
+    return result!.value;
   }
 
   async function put(data: MessageData): Promise<void> {
@@ -436,11 +462,12 @@ export const newWssClient = (
 
     activeWSS?.close({ code: 1000, reason: "Client closed" });
 
-    if (connectionState !== ConnectionState.Opened) handleConnectionClose();
+    if (connectionState !== ConnectionState.Opened) {
+      handleConnectionClose();
+    }
   }
 
   function reconnect(): void {
-    console.log("Manual reconnect triggered.");
     clearReconnectTimers();
     reconnectAttempts = 0;
     if (connectionState === ConnectionState.Closed || !activeWSS) {

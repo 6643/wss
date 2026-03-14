@@ -39,12 +39,16 @@ func (r writeRequest) waitResult(ctx context.Context) error {
 	case err := <-r.result:
 		return err
 	case <-ctx.Done():
-		select {
-		case err := <-r.result:
-			return err
-		default:
-			return ctx.Err()
-		}
+		return r.resolveAfterDone(ctx)
+	}
+}
+
+func (r writeRequest) resolveAfterDone(ctx context.Context) error {
+	select {
+	case err := <-r.result:
+		return err
+	default:
+		return ctx.Err()
 	}
 }
 

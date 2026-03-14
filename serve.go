@@ -154,20 +154,37 @@ func (s *Server) closeIdleConnections() {
 	defer ticker.Stop()
 
 	for {
-		select {
-		case <-ticker.C:
-			s.mu.Lock()
-			for id, conn := range s.conns {
-				if time.Since(conn.lastActiveAt()) > s.connIdleTimeout {
-					conn.closeWithStatus(websocket.StatusNormalClosure, "timeout")
-					delete(s.conns, id)
-				}
-			}
-			s.mu.Unlock()
-		case <-s.done:
+		if !s.tickIdle(ticker) {
 			return
 		}
 	}
+}
+
+func (s *Server) tickIdle(ticker *time.Ticker) bool {
+	select {
+	case <-ticker.C:
+		s.cleanupIdle()
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
+func (s *Server) cleanupIdle() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, conn := range s.conns {
+		s.checkAndCloseIdle(id, conn)
+	}
+}
+
+func (s *Server) checkAndCloseIdle(id string, conn *serverConn) {
+	if time.Since(conn.lastActiveAt()) <= s.connIdleTimeout {
+		return
+	}
+	conn.closeWithStatus(websocket.StatusNormalClosure, "timeout")
+	delete(s.conns, id)
 }
 
 // ServeHTTP 将一个 HTTP 连接升级为 WebSocket 并进行管理。
@@ -180,11 +197,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}
+	s.acceptAndHandle(w, r)
+}
+
+func (s *Server) acceptAndHandle(w http.ResponseWriter, r *http.Request) {
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		log.Printf("upgrade failed: %v", err)
 		return
 	}
+	s.handleAcceptedConn(c, r)
+}
+
+func (s *Server) handleAcceptedConn(c *websocket.Conn, r *http.Request) {
 	conn := newServerConnection(c, r)
 
 	s.mu.Lock()
